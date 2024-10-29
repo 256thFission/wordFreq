@@ -13,6 +13,10 @@ from typing import Dict, List, Set
 import multiprocessing as mp
 from functools import partial
 import warnings
+import os
+import traceback
+import gc
+
 
 warnings.filterwarnings('ignore')
 
@@ -232,6 +236,10 @@ class ClinicalWeightIndexer:
 def process_chunk(args):
     """Process a chunk of clinical notes"""
     chunk, chunk_id = args  # Unpack the arguments
+    if chunk.empty:
+        logging.warning(f"Chunk {chunk_id} is empty. Skipping.")
+        return {}
+
     indexer = ClinicalWeightIndexer()
 
     for note in tqdm(chunk['text'], desc=f'Processing chunk {chunk_id}'):
@@ -242,14 +250,25 @@ def process_chunk(args):
             indexer.analyze_segments(segments)
         except Exception as e:
             logging.error(f"Error processing note in chunk {chunk_id}: {str(e)}")
+            logging.error(f"Note content: {note}")
+            logging.error(traceback.format_exc())
             continue
 
-    return {
+    result = {
         'term_freq': dict(indexer.term_freq),
         'co_occurrences': {k: dict(v) for k, v in indexer.co_occurrences.items()},
         'total_words': indexer.total_words,
         'total_segments': indexer.total_segments
     }
+
+    output_folder = 'results'
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Save intermediate result in the specified folder
+    with open(os.path.join(output_folder, f'chunk_{chunk_id}_result.json'), 'w') as f:
+        json.dump(result, f)
+
+    return result
 
 
 def merge_results(results: List[Dict]) -> Dict:
@@ -297,7 +316,7 @@ def save_weights(weights: Dict, filename: str):
 
 def main():
     # Configuration
-    CHUNK_SIZE = 1000  # Adjust based on available memory
+    CHUNK_SIZE = 500  # Reduced chunk size to lower memory usage
     NUM_PROCESSES = max(1, mp.cpu_count() - 1)  # Leave one CPU free
     INPUT_FILE = 'discharge.csv'
     OUTPUT_FILE = 'clinical_weights.json'
@@ -311,8 +330,17 @@ def main():
 
         logging.info(f"Processing {total_rows} notes in {num_chunks} chunks")
 
-        # Process chunks in parallel
+        # Load existing results if they exist
         results = []
+        for i in range(num_chunks):
+            if os.path.exists(f'chunk_{i}_result.json'):
+                with open(f'chunk_{i}_result.json', 'r') as f:
+                    results.append(json.load(f))
+                logging.info(f"Loaded existing result for chunk {i + 1}/{num_chunks}")
+            else:
+                break
+
+        # Process remaining chunks in parallel
         with mp.Pool(NUM_PROCESSES) as pool:
             # Create iterator of (chunk, chunk_id) tuples
             chunks = enumerate(pd.read_csv(
@@ -321,16 +349,20 @@ def main():
                 usecols=['text']
             ))
 
-            # Process chunks
-            for result in tqdm(
-                    pool.imap(process_chunk, ((chunk, i) for i, chunk in chunks)),
-                    total=num_chunks,
+            # Skip already processed chunks
+            for _ in range(len(results)):
+                next(chunks, None)
+
+            # Process remaining chunks
+            for i, result in enumerate(tqdm(
+                    pool.imap(process_chunk, ((chunk, i + len(results)) for i, chunk in chunks)),
+                    total=num_chunks - len(results),
                     desc="Processing chunks"
-            ):
+            )):
                 results.append(result)
                 gc.collect()  # Free memory
 
-                logging.info(f"Completed chunk {i + 1}/{num_chunks}")
+                logging.info(f"Completed chunk {i + 1 + len(results)}/{num_chunks}")
 
         logging.info("Merging results...")
         merged = merge_results(results)
